@@ -193,3 +193,126 @@ dump 不会替代下单撮合主链路，而是插入同一事件流中的“状
 ### 10.5 恢复路径（补充）
 
 `ExchangeCore.startup()` 会调用 `serializationProcessor.replayJournalFullAndThenEnableJouraling(...)`，即基于 snapshot + journal 回放恢复状态，再继续处理新命令。
+
+---
+
+## 11. 实际运行中：下单与持久化如何配合
+
+线上建议把下单与 dump 当作同一事件流里的两类命令来使用。
+
+### 11.1 常见配合模式
+
+- 模式 A：持续下单 + 周期性 dump  
+  交易持续进行，定时插入 `ApiPersistState`，获取某个序列点的一致快照。
+- 模式 B：关键运维点 dump  
+  先等待一批关键下单完成，再发 `ApiPersistState` 并等待返回，作为“结算点/切换点”。
+- 模式 C：恢复优先  
+  低频 dump + 高频 journal，重启时用 `snapshot + replay` 平衡恢复速度与存储成本。
+
+### 11.2 为什么不会和下单“打架”
+
+- `ApiPersistState` 被拆成相邻两条命令（matching/risk），仍按 RingBuffer 全序执行。
+- 下单与 dump 共用同一顺序语义，不会出现“快照先于已提交订单落地”的乱序问题。
+- 调用侧应等待 `submitPersistCommandAsync()` 结果，再做“已安全持久化”的后续动作。
+
+---
+
+## 12. 撮合、冻结、扣款如何保证强一致
+
+### 12.1 资金语义（先冻结、后清算）
+
+- R1：`PLACE_ORDER` 先做风控与冻结，失败不入撮合。
+- ME：只撮合 `VALID_FOR_MATCHING_ENGINE` 的订单。
+- R2：根据成交/拒单事件做扣款、划转、释放冻结和手续费入账。
+
+这保证了不会出现“未冻结先成交”或“成交后未释放”的状态撕裂。
+
+### 12.2 一致性机制
+
+- 单 RingBuffer 顺序执行（命令全序）。
+- `eventsGroup` + TwoStep（R1 主处理器触发组边界后，R2 对同组收敛处理）。
+- 撮合结果通过 `cmd.matcherEvent` 传递给 R2，同命令内闭环清算。
+- 结果回调在链路末端发出，外部可见状态与内部序列一致。
+
+---
+
+## 13. 关键源码锚点（可直接对照）
+
+### 13.1 下单与回调
+
+- `src/main/java/exchange/core2/core/ExchangeApi.java`
+  - `NEW_ORDER_TRANSLATOR`
+  - `submitCommandAsync(...)`
+  - `processResult(...)`
+
+```java
+// ExchangeApi.NEW_ORDER_TRANSLATOR
+cmd.command = OrderCommandType.PLACE_ORDER;
+cmd.price = api.price;
+cmd.reserveBidPrice = api.reservePrice;
+cmd.size = api.size;
+cmd.orderId = api.orderId;
+cmd.uid = api.uid;
+cmd.symbol = api.symbol;
+cmd.resultCode = CommandResultCode.NEW;
+```
+
+### 13.2 R1 风控冻结
+
+- `src/main/java/exchange/core2/core/processors/RiskEngine.java`
+  - `preProcessCommand(...)`
+  - `placeOrderRiskCheck(...)`
+  - `placeExchangeOrder(...)`
+
+```java
+case PLACE_ORDER:
+    if (uidForThisHandler(cmd.uid)) {
+        cmd.resultCode = placeOrderRiskCheck(cmd);
+    }
+    return false;
+```
+
+### 13.3 只撮合通过风控的订单
+
+- `src/main/java/exchange/core2/core/orderbook/IOrderBook.java`
+  - `processCommand(...)`
+
+```java
+} else if (commandType == OrderCommandType.PLACE_ORDER) {
+    if (cmd.resultCode == CommandResultCode.VALID_FOR_MATCHING_ENGINE) {
+        orderBook.newOrder(cmd);
+        return CommandResultCode.SUCCESS;
+    } else {
+        return cmd.resultCode;
+    }
+}
+```
+
+### 13.4 R2 清算扣款/释放
+
+- `src/main/java/exchange/core2/core/processors/RiskEngine.java`
+  - `handlerRiskRelease(...)`
+  - `handleMatcherEventsExchangeBuy(...)`
+  - `handleMatcherEventsExchangeSell(...)`
+  - `handleMatcherRejectReduceEventExchange(...)`
+
+```java
+if (mte.eventType == MatcherEventType.REDUCE || mte.eventType == MatcherEventType.REJECT) {
+    handleMatcherRejectReduceEventExchange(cmd, mte, spec, takerSell, takerUp);
+}
+```
+
+### 13.5 Dump 两阶段持久化
+
+- `src/main/java/exchange/core2/core/ExchangeApi.java`
+  - `publishPersistCmd(...)`
+  - `submitPersistCommandAsync(...)`
+- `src/main/java/exchange/core2/core/processors/MatchingEngineRouter.java`
+  - `PERSIST_STATE_MATCHING` 分支
+- `src/main/java/exchange/core2/core/processors/RiskEngine.java`
+  - `PERSIST_STATE_RISK` 分支
+
+```java
+cmdMatching.command = OrderCommandType.PERSIST_STATE_MATCHING;
+cmdRisk.command = OrderCommandType.PERSIST_STATE_RISK;
+```
